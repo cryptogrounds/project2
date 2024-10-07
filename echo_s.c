@@ -5,12 +5,32 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <regex.h>
 #include <netinet/in.h>
 #include "logging.h"
 #define BUFFER_SIZE 1024
+#define ATTEMPTS 10
 
 static int PORT = 9876;
 int LOG_LEVEL = 3;
+
+enum http_request_type {
+	GET,
+	POST,
+	UNDEFINED
+};
+
+enum http_response_status {
+	INVALID_REQ = 400,
+	INVALID_URI = 404, 
+	OK_REQ = 200, 
+};
+
+struct http_request {
+	enum http_request_type request_type;
+	char* request_uri;
+	char* request_protocol;
+}
 
 struct sockaddr_in getSocketAddr() {
 	struct sockaddr_in addr;
@@ -21,25 +41,109 @@ struct sockaddr_in getSocketAddr() {
 	return addr;
 }
 
-int read_prefix(int buf_len, char buf[]) {
-	char* result = malloc(5);
-	int status = 0;
-	if (buf_len) {
-		strncpy(result, buf, 4);
-		if (strncmp(result, "QUIT", 4) == 0) {
-			status = -1;
-			TRACE "QUIT Command Executed" ENDL;
-		}
-		else {
-			strncpy(result, buf, 5);
-			if (strncmp(result, "CLOSE", 5) == 0) {
-				status = 1;
-				TRACE "CLOSE Command Executed" ENDL;
-			}
+enum http_request_type getRequestType(char* str) {
+	if (strcmp(str, "GET")) return GET;
+	if (strcmp(str, "POST")) return POST;
+	return UNDEFINED;
+}
+
+struct http_request arrToRequest(
+	char* arr[], 
+	size_t arr_len
+) {
+	struct http_request request;
+	
+	if (arr_len != 3) {
+		return request;
+	}
+
+	request.request_type = getRequestType(arr[0]);
+	request.request_uri = arr[1];
+	request.request_protocol = arr[2];
+
+	return request;
+}
+
+struct http_request bufToRequest(
+	int buf_len, 
+	char buf[]
+) {
+
+	int buf_size = sizeof(buf);
+	int part_count = 0;
+
+	for (int i = 0; i < buf_size; i++) {
+		if (buf[i] == ' ') {
+			part_count++;
 		}
 	}
-	free(result);
-	return status;
+
+	if (part_count != 3) {
+		return {
+			UNDEFINED,
+			NULL,
+			NULL
+		};
+	}
+
+	// ex: GET google.com HTTP/1.0
+	// - GET: [0, 2]
+	// - google.com: [4, 13]
+	// - HTTP/1.0: [15, 23]
+
+	char* parts[part_count];
+	int part_index = 0;
+	int marker = 0;
+
+	for (int i = 0; i < buf_size; i++) {
+		if (buf[i] == " ") {
+			int part_size = i - marker;
+			char* part = malloc(part_size);
+    		strncpy(part, buf + marker, buf_size - marker`);
+			parts[part_index++];
+			marker = i + 1;
+		}
+	} 
+
+	struct http_request request = arrToRequest(parts);
+	free(parts);
+	return request;
+}
+
+int sanitizeUri(char* loc) {
+	regex_t regex;
+	return regcomp(&regex, "[a-zA-Z]+[.]+(jpg|html)", 0) == 0 
+		&& regexec(&regex, loc, 0, NULL, 0) == 0;
+}
+
+int getFile(char* loc) {
+	if (sanitizeUri(loc) == 0) return -1;
+	return fopen(loc, "r");
+}
+
+enum http_response_status handleRequest(
+	struct http_request request,
+	int connFd
+) {
+	switch (request.request_type) {
+		case GET:
+			int fd = getFile(request.request_uri);
+			if (fd == -1) return INVALID_URI;
+
+			char buf[BUFFER_SIZE];
+			int bRead = read(fd, buf, BUFFER_SIZE);
+			if (bRead < 1) {
+				fclose(fd);
+				return INVALID_URI;
+			}
+
+			write(connFd, buf, bRead);
+			fclose(fd);
+			free(buf);
+			return OK_REQ;
+		default:
+			return INVALID_REQ;
+	}
 }
 
 int processConnection(int connFd) {
@@ -54,14 +158,15 @@ int processConnection(int connFd) {
 				exit(-1);
 			}
 			TRACE "Connection closed unexpectedly" ENDL;
+			free(buf);
 			return 1;
 		}
 		TRACE "Block Received" ENDL;
-		int prefix_status = read_prefix(BUFFER_SIZE, buf);
-		if (prefix_status == -1) return 1;
-		if (prefix_status == 1) break;
-		write(connFd, buf, bRead);
+		
+		struct http_request request = buf_to_request(BUFFER_SIZE, buf);
+		enum http_response_status response = handleRequest(request, connFd)
 	}
+	free(buf);
 	return 0;
 }
 
@@ -83,12 +188,14 @@ void setLogLevel(int argc, char* argv[]) {
 int bindSocket(int socketFd) {
 	int binded = 0;
 	int listenFd = -1;
+	int bindAttempt = 0;
 	struct sockaddr_in addr = getSocketAddr();
-	while (!binded) {
+	while (!binded && bindAttempt < ATTEMPTS) {
 		listenFd = bind(socketFd, (struct sockaddr*)&addr, sizeof(addr));
 		if (listenFd < 0) {
 			ERROR "Bind Failed... Trying new port." ENDL;
 			addr.sin_port = htons(++PORT);
+			bindAttempt++;
 			continue;
 		}
 		binded = 1;
