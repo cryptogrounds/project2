@@ -30,7 +30,7 @@ struct http_request {
 	enum http_request_type request_type;
 	char* request_uri;
 	char* request_protocol;
-}
+};
 
 struct sockaddr_in getSocketAddr() {
 	struct sockaddr_in addr;
@@ -39,7 +39,7 @@ struct sockaddr_in getSocketAddr() {
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	addr.sin_port = htons(PORT);
 	return addr;
-}
+};
 
 enum http_request_type getRequestType(char* str) {
 	if (strcmp(str, "GET")) return GET;
@@ -66,10 +66,10 @@ struct http_request arrToRequest(
 
 struct http_request bufToRequest(
 	int buf_len, 
-	char buf[]
+	char buf[],
+	int buf_size
 ) {
 
-	int buf_size = sizeof(buf);
 	int part_count = 0;
 
 	for (int i = 0; i < buf_size; i++) {
@@ -79,11 +79,12 @@ struct http_request bufToRequest(
 	}
 
 	if (part_count != 3) {
-		return {
+		struct http_request empty = {
 			UNDEFINED,
 			NULL,
 			NULL
 		};
+		return empty;
 	}
 
 	// ex: GET google.com HTTP/1.0
@@ -96,16 +97,16 @@ struct http_request bufToRequest(
 	int marker = 0;
 
 	for (int i = 0; i < buf_size; i++) {
-		if (buf[i] == " ") {
+		if (buf[i] == ' ') {
 			int part_size = i - marker;
 			char* part = malloc(part_size);
-    		strncpy(part, buf + marker, buf_size - marker`);
+    		strncpy(part, buf + marker, buf_size - marker);
 			parts[part_index++];
 			marker = i + 1;
 		}
 	} 
 
-	struct http_request request = arrToRequest(parts);
+	struct http_request request = arrToRequest(parts, part_count);
 	free(parts);
 	return request;
 }
@@ -116,8 +117,8 @@ int sanitizeUri(char* loc) {
 		&& regexec(&regex, loc, 0, NULL, 0) == 0;
 }
 
-int getFile(char* loc) {
-	if (sanitizeUri(loc) == 0) return -1;
+FILE* getFile(char* loc) {
+	if (sanitizeUri(loc) == 0) return NULL;
 	return fopen(loc, "r");
 }
 
@@ -125,25 +126,22 @@ enum http_response_status handleRequest(
 	struct http_request request,
 	int connFd
 ) {
-	switch (request.request_type) {
-		case GET:
-			int fd = getFile(request.request_uri);
-			if (fd == -1) return INVALID_URI;
+	if (request.request_type != GET) return INVALID_REQ;
 
-			char buf[BUFFER_SIZE];
-			int bRead = read(fd, buf, BUFFER_SIZE);
-			if (bRead < 1) {
-				fclose(fd);
-				return INVALID_URI;
-			}
+	FILE* file = getFile(request.request_uri);
+	if (!file) return INVALID_URI;
 
-			write(connFd, buf, bRead);
-			fclose(fd);
-			free(buf);
-			return OK_REQ;
-		default:
-			return INVALID_REQ;
+	char buf[BUFFER_SIZE];
+	int bRead = fread(file, buf, BUFFER_SIZE);
+	if (bRead < 1) {
+		fclose(file);
+		return INVALID_URI;
 	}
+		
+	write(connFd, buf, bRead);
+	fclose(file);
+	free(buf);
+	return OK_REQ;
 }
 
 int processConnection(int connFd) {
@@ -163,8 +161,8 @@ int processConnection(int connFd) {
 		}
 		TRACE "Block Received" ENDL;
 		
-		struct http_request request = buf_to_request(BUFFER_SIZE, buf);
-		enum http_response_status response = handleRequest(request, connFd)
+		struct http_request request = bufToRequest(BUFFER_SIZE, buf, bRead);
+		enum http_response_status response = handleRequest(request, connFd);
 	}
 	free(buf);
 	return 0;
