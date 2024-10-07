@@ -132,22 +132,24 @@ enum http_response_status handleRequest(
 	if (!file) return INVALID_URI;
 
 	char buf[BUFFER_SIZE];
-	int bRead = fread(file, buf, BUFFER_SIZE);
-	if (bRead < 1) {
-		fclose(file);
-		return INVALID_URI;
+	size_t bytesRead = 0;
+
+	while ((bytesRead = fread(buf, 1, BUFFER_SIZE, file)) > 0) {
+		if (write(connFd, buf, bytesRead) < 0) {
+			fclose(file);
+			return INVALID_REQ;
+		}
 	}
-		
-	write(connFd, buf, bRead);
+
 	fclose(file);
-	free(buf);
 	return OK_REQ;
 }
 
-int processConnection(int connFd) {
+int processConnection(
+	int connFd
+) {
 	char buf[BUFFER_SIZE];
-	int process = 1;
-	while (process) {
+	while (1) {
 		TRACE "Awaiting Block" ENDL;
 		int bRead = read(connFd, buf, BUFFER_SIZE);
 		if (bRead < 1) {
@@ -156,19 +158,35 @@ int processConnection(int connFd) {
 				exit(-1);
 			}
 			TRACE "Connection closed unexpectedly" ENDL;
-			free(buf);
 			return 1;
 		}
 		TRACE "Block Received" ENDL;
 		
 		struct http_request request = bufToRequest(BUFFER_SIZE, buf, bRead);
+		if (request.request_type == UNDEFINED) {
+			char *badRequestMsg = "HTTP/1.0 400 Bad Request\r\n\r\n";
+			write(connFd, badRequestMsg, strlen(badRequestMsg));
+			return 1;
+		}
+
 		enum http_response_status response = handleRequest(request, connFd);
+		if (response == INVALID_URI) {
+			char *notFoundMsg = "HTTP/1.0 404 Not Found\r\n\r\n";
+			write(connFd, notFoundMsg, strlen(notFoundMsg));
+			return 1;
+		} else if (response == INVALID_REQ) {
+			char *badRequestMsg = "HTTP/1.0 400 Bad Request\r\n\r\n";
+			write(connFd, badRequestMsg, strlen(badRequestMsg));
+			return 1;
+		}
 	}
-	free(buf);
 	return 0;
 }
 
-void setLogLevel(int argc, char* argv[]) {
+void setLogLevel(
+	int argc, 
+	char* argv[]
+) {
 	int opt = 0;
 	while ((opt = getopt(argc, argv, "d: ")) != -1) {
 		switch (opt) {
