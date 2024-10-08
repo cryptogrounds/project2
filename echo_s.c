@@ -15,9 +15,9 @@ static int PORT = 9876;
 int LOG_LEVEL = 3;
 
 enum http_request_type {
-	GET,
-	POST,
-	UNDEFINED
+	GET = 0,
+	POST = 1,
+	UNDEFINED = -1
 };
 
 enum http_response_status {
@@ -42,8 +42,8 @@ struct sockaddr_in getSocketAddr() {
 };
 
 enum http_request_type getRequestType(char* str) {
-	if (strcmp(str, "GET")) return GET;
-	if (strcmp(str, "POST")) return POST;
+	if (strcmp(str, "GET") == 0) return GET;
+	if (strcmp(str, "POST") == 0) return POST;
 	return UNDEFINED;
 }
 
@@ -54,12 +54,15 @@ struct http_request arrToRequest(
 	struct http_request request;
 	
 	if (arr_len != 3) {
+		free(arr[0]);
 		return request;
 	}
 
 	request.request_type = getRequestType(arr[0]);
 	request.request_uri = arr[1];
 	request.request_protocol = arr[2];
+	
+	free(arr[0]);
 
 	return request;
 }
@@ -69,11 +72,10 @@ struct http_request bufToRequest(
 	char buf[],
 	int buf_size
 ) {
-
-	int part_count = 0;
+	int part_count = 1;
 
 	for (int i = 0; i < buf_size; i++) {
-		if (buf[i] == ' ') {
+		if (buf[i] == ' ' || buf[i] == '\0') {
 			part_count++;
 		}
 	}
@@ -87,61 +89,97 @@ struct http_request bufToRequest(
 		return empty;
 	}
 
-	// ex: GET google.com HTTP/1.0
-	// - GET: [0, 2]
-	// - google.com: [4, 13]
-	// - HTTP/1.0: [15, 23]
-
 	char* parts[part_count];
 	int part_index = 0;
 	int marker = 0;
 
 	for (int i = 0; i < buf_size; i++) {
-		if (buf[i] == ' ') {
+		if (buf[i] == ' ' || buf[i] == '\0' || i == buf_size - 1) {
 			int part_size = i - marker;
-			char* part = malloc(part_size);
-    		strncpy(part, buf + marker, buf_size - marker);
-			parts[part_index++];
+			char* part = malloc(part_size + 1);
+
+			if (part == NULL) {
+				perror("malloc failed");
+				exit(EXIT_FAILURE);
+			}
+
+    			strncpy(part, buf + marker, part_size);
+			part[part_size] = '\0';
+			parts[part_index++] = part;
 			marker = i + 1;
 		}
 	} 
 
-	struct http_request request = arrToRequest(parts, part_count);
-	free(parts);
-	return request;
+	return arrToRequest(parts, part_count);
 }
 
 int sanitizeUri(char* loc) {
 	regex_t regex;
-	return regcomp(&regex, "[a-zA-Z]+[.]+(jpg|html)", 0) == 0 
-		&& regexec(&regex, loc, 0, NULL, 0) == 0;
+	if (regcomp(&regex, "[a-zA-Z]+[1-9]\\.(jpg|html)", REG_EXTENDED) != 0) {
+		return 0;
+	}
+	int regex_status = regexec(&regex, (const char*)loc, 0, NULL, 0);
+	regfree(&regex);
+	return regex_status == 0;
 }
 
-FILE* getFile(char* loc) {
-	if (sanitizeUri(loc) == 0) return NULL;
-	return fopen(loc, "r");
+FILE* getFile(
+	char* loc
+) {
+	return sanitizeUri(loc) == 0 
+		? NULL 
+		: fopen(loc, "r");
 }
 
 enum http_response_status handleRequest(
 	struct http_request request,
 	int connFd
 ) {
-	if (request.request_type != GET) return INVALID_REQ;
+	if (request.request_type != GET || strcmp(request.request_protocol, "HTTP/1.0") != 0) {
+		dprintf(connFd, "HTTP/1.0 400 Bad Request\r\n\r\n");
+		free(request.request_uri);
+		free(request.request_protocol);
+		return INVALID_REQ;
+	}
 
 	FILE* file = getFile(request.request_uri);
-	if (!file) return INVALID_URI;
+	if (!file) {
+		dprintf(connFd, "HTTP/1.0 404 Not Found\r\n\r\n");
+		free(request.request_uri);
+		free(request.request_protocol);
+		return INVALID_URI;
+	}
+
+	char* file_ext = strrchr(request.request_uri, '.');
+	char* content_type = file_ext && strcmp(file_ext, ".jpg") == 0
+		? "image/jpeg"
+		: "text/html";
+	fseek(file, 0, SEEK_END);
+	size_t content_len = ftell(file);
+	fseek(file, 0, SEEK_SET);
+
+	dprintf(connFd, "HTTP/1.1 200 OK\r\n");
+    	dprintf(connFd, "Content-Length: %zu\r\n", content_len);
+    	dprintf(connFd, "Content-Type: %s\r\n", content_type);
+    	dprintf(connFd, "\r\n");
 
 	char buf[BUFFER_SIZE];
 	size_t bytesRead = 0;
 
+
 	while ((bytesRead = fread(buf, 1, BUFFER_SIZE, file)) > 0) {
 		if (write(connFd, buf, bytesRead) < 0) {
 			fclose(file);
+			free(request.request_uri);
+			free(request.request_protocol);
 			return INVALID_REQ;
 		}
 	}
 
 	fclose(file);
+	free(request.request_uri);
+	free(request.request_protocol);
+
 	return OK_REQ;
 }
 
@@ -166,19 +204,11 @@ int processConnection(
 		if (request.request_type == UNDEFINED) {
 			char *badRequestMsg = "HTTP/1.0 400 Bad Request\r\n\r\n";
 			write(connFd, badRequestMsg, strlen(badRequestMsg));
-			return 1;
+			continue;
 		}
 
 		enum http_response_status response = handleRequest(request, connFd);
-		if (response == INVALID_URI) {
-			char *notFoundMsg = "HTTP/1.0 404 Not Found\r\n\r\n";
-			write(connFd, notFoundMsg, strlen(notFoundMsg));
-			return 1;
-		} else if (response == INVALID_REQ) {
-			char *badRequestMsg = "HTTP/1.0 400 Bad Request\r\n\r\n";
-			write(connFd, badRequestMsg, strlen(badRequestMsg));
-			return 1;
-		}
+
 	}
 	return 0;
 }
